@@ -1,0 +1,9 @@
+credentials.json
+state.json
+trade_history.json
+bot_activity.log
+backtest_results.json
+__pycache__/
+*.pyc
+.venv/
+.env
