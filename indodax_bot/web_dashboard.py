@@ -1,13 +1,12 @@
 """
-FastAPI Real-time Web Dashboard with Interactive Manual Buy & Sell Controls for INDODAX DUAL ENGINE.
-Provides dark-theme dashboard with live updates, manual order forms, open position sell buttons, metrics, candidate tables, and emergency controls.
+FastAPI Real-time Web Dashboard with V6.1 Expectancy Analytics & Interactive Controls.
 """
 
 import os
 import json
 import logging
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -29,7 +28,6 @@ def create_dashboard_app(bot_controller: Any) -> FastAPI:
 
     @app.get("/api/status", response_class=JSONResponse)
     def get_bot_status():
-        """Fetch complete current bot status snapshot."""
         try:
             return bot_controller.get_dashboard_state()
         except Exception as e:
@@ -38,14 +36,12 @@ def create_dashboard_app(bot_controller: Any) -> FastAPI:
 
     @app.post("/api/emergency_stop", response_class=JSONResponse)
     def trigger_emergency_stop():
-        """Trigger Emergency Stop mechanism."""
         bot_controller.emergency_stop_triggered = True
         logger.warning("EMERGENCY STOP TRIGGERED FROM DASHBOARD!")
         return {"status": "EMERGENCY_STOP_ACTIVATED", "message": "All new entries halted immediately."}
 
     @app.post("/api/manual_buy", response_class=JSONResponse)
     def manual_buy_endpoint(req: ManualBuyRequest):
-        """Execute interactive manual buy order."""
         try:
             res = bot_controller.manual_buy(
                 pair_id=req.pair_id,
@@ -59,7 +55,6 @@ def create_dashboard_app(bot_controller: Any) -> FastAPI:
 
     @app.post("/api/manual_sell", response_class=JSONResponse)
     def manual_sell_endpoint(req: ManualSellRequest):
-        """Execute interactive manual sell / close position."""
         try:
             res = bot_controller.manual_sell(
                 position_id=req.position_id,
@@ -72,7 +67,6 @@ def create_dashboard_app(bot_controller: Any) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def get_dashboard_html():
-        """Serve complete modern single-page dashboard HTML/CSS/JS UI."""
         return HTML_DASHBOARD_TEMPLATE
 
     return app
@@ -82,21 +76,20 @@ HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>INDODAX DUAL ENGINE — V5.3-MACO R3</title>
+    <title>INDODAX DUAL ENGINE — V6.1-MACO R11</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background-color: #0d1117; color: #c9d1d9; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
         .card { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 20px; }
         .card-header { background-color: #21262d; border-bottom: 1px solid #30363d; font-weight: 600; color: #58a6ff; }
-        .metric-title { font-size: 0.85rem; color: #8b949e; text-transform: uppercase; }
-        .metric-value { font-size: 1.5rem; font-weight: 700; color: #f0f6fc; }
+        .metric-title { font-size: 0.82rem; color: #8b949e; text-transform: uppercase; }
+        .metric-value { font-size: 1.4rem; font-weight: 700; color: #f0f6fc; }
         .badge-paper { background-color: #238636; color: #ffffff; }
         .badge-live-disabled { background-color: #da3633; color: #ffffff; }
         .table-dark { background-color: #161b22; color: #c9d1d9; }
         .table-dark th { background-color: #21262d; color: #8b949e; }
         .positive { color: #3fb950; font-weight: 600; }
         .negative { color: #f85149; font-weight: 600; }
-        .neutral { color: #d29922; }
     </style>
 </head>
 <body class="p-4">
@@ -104,8 +97,8 @@ HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         <!-- Top Banner -->
         <div class="d-flex justify-content-between align-items-center mb-4 pb-2 border-bottom border-secondary">
             <div>
-                <h2 class="m-0 text-light font-weight-bold">INDODAX DUAL ENGINE <span class="fs-6 text-primary">V5.3-MACO R3</span></h2>
-                <small class="text-secondary">Market: Indodax IDR Spot | Pure Scalping & Extreme Momentum Hunter</small>
+                <h2 class="m-0 text-light font-weight-bold">INDODAX DUAL ENGINE <span class="fs-6 text-primary">V6.1-MACO R11</span></h2>
+                <small class="text-secondary">Cost-Aware Adaptive Scalper + Extreme Momentum Hunter</small>
             </div>
             <div>
                 <span class="badge badge-paper p-2 fs-6">OPERATING MODE: PAPER_TRADING</span>
@@ -132,37 +125,36 @@ HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             </div>
             <div class="col-md-2">
                 <div class="card p-3">
-                    <div class="metric-title">Capital Tier</div>
-                    <div class="metric-value text-info" id="valCapitalTier">TIER 1</div>
-                    <small id="valTierCap" class="text-secondary">Cap: 40% per asset</small>
+                    <div class="metric-title">Net Expectancy</div>
+                    <div class="metric-value text-info" id="valNetExpectancy">Rp 0</div>
+                    <small id="valWinRate" class="text-secondary">Win Rate: 0.0%</small>
                 </div>
             </div>
             <div class="col-md-2">
                 <div class="card p-3">
                     <div class="metric-title">Portfolio Exposure</div>
                     <div class="metric-value" id="valExposure">0.0%</div>
-                    <small class="text-secondary">Max Limit: 80%</small>
+                    <small class="text-secondary">Max Ceiling: 80%</small>
                 </div>
             </div>
             <div class="col-md-2">
                 <div class="card p-3">
-                    <div class="metric-title">Combined Portfolio Risk</div>
+                    <div class="metric-title">Aggregate Risk</div>
                     <div class="metric-value" id="valPortfolioRisk">0.0%</div>
-                    <small class="text-secondary">Max Budget: 2.0%</small>
+                    <small class="text-secondary">Max Budget: 3.0%</small>
                 </div>
             </div>
             <div class="col-md-2">
                 <div class="card p-3">
                     <div class="metric-title">Daily PnL / Loss</div>
                     <div class="metric-value" id="valDailyPnL">Rp 0</div>
-                    <small id="valDailyLossPct" class="text-secondary">Limit: 2.0%</small>
+                    <small id="valDailyLossPct" class="text-secondary">Limit: 3.0%</small>
                 </div>
             </div>
         </div>
 
         <!-- Interactive Manual Buy Order Form & Open Positions Row -->
         <div class="row">
-            <!-- Manual Buy Order Card -->
             <div class="col-md-4">
                 <div class="card">
                     <div class="card-header bg-dark text-success">🟢 MANUAL BUY ORDER PANEL</div>
@@ -188,7 +180,6 @@ HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </div>
             </div>
 
-            <!-- Open Positions Table Card -->
             <div class="col-md-8">
                 <div class="card">
                     <div class="card-header d-flex justify-content-between align-items-center">
@@ -222,7 +213,7 @@ HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         <div class="row">
             <div class="col-md-6">
                 <div class="card">
-                    <div class="card-header">ENGINE A CANDIDATES — PURE SCALPER (1m/5m/15m)</div>
+                    <div class="card-header">ENGINE A CANDIDATES — COST-AWARE SCALPER (5m/15m)</div>
                     <div class="card-body p-0 table-responsive">
                         <table class="table table-dark table-hover m-0 fs-7">
                             <thead>
@@ -267,7 +258,7 @@ HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- Rejections and API Health Footer -->
+        <!-- Rejections and Analytics Footer -->
         <div class="row">
             <div class="col-md-8">
                 <div class="card">
@@ -282,7 +273,7 @@ HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             <div class="col-md-4">
                 <div class="card">
                     <div class="card-header">INDODAX API & SYSTEM HEALTH</div>
-                    <div class="card-body">
+                    <div class="card-body fs-7">
                         <div>API Status: <span id="valApiStatus" class="badge bg-success">HEALTHY</span></div>
                         <div>Success Rate: <span id="valApiSuccess">100%</span></div>
                         <div>Latency: <span id="valApiLatency">0 ms</span></div>
@@ -313,11 +304,15 @@ HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             document.getElementById("valEquity").innerText = formatIDR(d.portfolio.equity);
             document.getElementById("valAvailableIdr").innerText = formatIDR(d.portfolio.cash);
             document.getElementById("valReservePct").innerText = "Cash Reserve: " + d.portfolio.cash_reserve_pct.toFixed(1) + "%";
-            document.getElementById("valCapitalTier").innerText = d.portfolio.capital_tier;
             document.getElementById("valExposure").innerText = d.portfolio.exposure_pct.toFixed(1) + "%";
             document.getElementById("valPortfolioRisk").innerText = d.portfolio.combined_planned_risk_pct.toFixed(2) + "%";
             document.getElementById("valDailyPnL").innerText = formatIDR(d.portfolio.daily_pnl_idr);
             document.getElementById("valDailyLossPct").innerText = "Daily Loss: " + d.portfolio.daily_loss_pct.toFixed(2) + "%";
+
+            if (d.analytics) {
+                document.getElementById("valNetExpectancy").innerText = formatIDR(d.analytics.net_expectancy_idr);
+                document.getElementById("valWinRate").innerText = "Win Rate: " + d.analytics.win_rate_pct.toFixed(1) + "%";
+            }
 
             // Open Positions
             const tblPos = document.getElementById("tblOpenPositions");

@@ -1,5 +1,5 @@
 """
-Terminal CLI Dashboard Renderer for INDODAX DUAL ENGINE.
+Terminal CLI Dashboard Renderer for INDODAX UNIFIED DUAL ENGINE V6.1-MACO R11.
 """
 
 import os
@@ -14,6 +14,7 @@ class CLIDashboard:
     def print_snapshot(state: Dict[str, Any]):
         """Render clean terminal summary snapshot."""
         p = state.get("portfolio", {})
+        analytics = state.get("analytics", {})
         open_pos = state.get("open_positions", [])
         cand_a = state.get("candidates_engine_a", [])
         cand_b = state.get("candidates_engine_b", [])
@@ -21,14 +22,14 @@ class CLIDashboard:
 
         os.system('cls' if os.name == 'nt' else 'clear')
         print("==================================================================================")
-        print(" INDODAX DUAL ENGINE V5.3-MACO R3 — PAPER TRADING ACTIVE")
-        print(" Market: Indodax IDR Spot | Strategy: Scalping (A) + Extreme Momentum (B)")
+        print(" INDODAX UNIFIED DUAL ENGINE V6.1-MACO R11 — PAPER TRADING ACTIVE")
+        print(" Cost-Aware Adaptive Scalper (A) + Extreme Momentum Hunter (B)")
         print("==================================================================================")
         print(f" Total Equity     : Rp {p.get('equity', 0):,.0f}")
         print(f" Available Cash   : Rp {p.get('cash', 0):,.0f} (Reserve: {p.get('cash_reserve_pct', 100):.1f}%)")
-        print(f" Capital Tier     : {p.get('capital_tier', 'TIER_1')}")
+        print(f" Net Expectancy   : Rp {analytics.get('net_expectancy_idr', 0):,.0f} (Win Rate: {analytics.get('win_rate_pct', 0):.1f}%)")
         print(f" Total Exposure   : {p.get('exposure_pct', 0):.1f}% (Max Ceiling: 80%)")
-        print(f" Portfolio Risk   : {p.get('combined_planned_risk_pct', 0):.2f}% (Max Limit: 2.0%)")
+        print(f" Portfolio Risk   : {p.get('combined_planned_risk_pct', 0):.2f}% (Max Limit: 3.0%)")
         print(f" Daily PnL / Loss : Rp {p.get('daily_pnl_idr', 0):,.0f} ({p.get('daily_loss_pct', 0):.2f}%)")
         print("----------------------------------------------------------------------------------")
         print(f" ACTIVE POSITIONS ({len(open_pos)}):")

@@ -1,6 +1,6 @@
 """
-Main Orchestrator Entry Point for INDODAX DUAL ENGINE.
-Version: V5.3-MACO R3
+Main Orchestrator Entry Point for INDODAX UNIFIED DUAL ENGINE ADAPTIVE TRADING SYSTEM.
+Version: V6.1-MACO R11
 """
 
 import sys
@@ -18,14 +18,17 @@ from typing import Dict, List, Any
 from indodax_bot.config import (
     VERSION, MARKET_NAME, OPERATING_MODE, LIVE_TRADING_ENABLED,
     DCA_ENABLED, LEVERAGE_ENABLED, MARTINGALE_ENABLED,
-    MAX_PORTFOLIO_EXPOSURE, MIN_CASH_RESERVE, MAX_PLANNED_RISK_PER_TRADE, MAX_COMBINED_PLANNED_RISK
+    DEFAULT_PAPER_INITIAL_IDR, MAX_DAILY_LOSS_PCT
 )
 from indodax_bot.indodax_api import IndodaxAPIClient
 from indodax_bot.market_data import MarketDataManager
+from indodax_bot.indicators import TechnicalIndicators, MarketRegimeDetector
 from indodax_bot.engine_a import ScalpingEngineA
 from indodax_bot.engine_b import ExtremeMomentumHunterEngineB
+from indodax_bot.engine_router import AdaptiveEngineRouter
 from indodax_bot.risk_controller import PortfolioRiskController
 from indodax_bot.portfolio import PortfolioManager
+from indodax_bot.expectancy_monitor import ExpectancyMonitor
 from indodax_bot.web_dashboard import create_dashboard_app
 from indodax_bot.cli_dashboard import CLIDashboard
 from indodax_bot.backtester import Backtester
@@ -41,7 +44,7 @@ logging.basicConfig(
 logger = logging.getLogger("IndodaxDualEngine")
 
 class IndodaxBotController:
-    def __init__(self, initial_cash_idr: float = 10_000_000.0):
+    def __init__(self, initial_cash_idr: float = DEFAULT_PAPER_INITIAL_IDR):
         self.api_client = IndodaxAPIClient()
         self.market_data = MarketDataManager(self.api_client)
         self.engine_a = ScalpingEngineA()
@@ -54,6 +57,7 @@ class IndodaxBotController:
 
         self.latest_candidates_a: List[Dict[str, Any]] = []
         self.latest_candidates_b: List[Dict[str, Any]] = []
+        self.equity_history: List[float] = [initial_cash_idr]
 
     def get_dashboard_state(self) -> Dict[str, Any]:
         """Construct full current dashboard snapshot state."""
@@ -62,7 +66,7 @@ class IndodaxBotController:
 
         equity = self.portfolio.get_current_equity(current_prices)
         cash = self.portfolio.cash_idr
-        tier_info = self.risk_controller.determine_capital_tier(equity)
+        self.equity_history.append(equity)
 
         unrealized_pnl = sum(p["unrealized_pnl"] for p in self.portfolio.open_positions)
         exposure_idr = sum(p["position_size_idr"] for p in self.portfolio.open_positions)
@@ -76,6 +80,13 @@ class IndodaxBotController:
         )
 
         daily_pnl_idr = equity - self.portfolio.start_of_day_equity
+
+        # Expectancy Analytics
+        analytics = ExpectancyMonitor.calculate_analytics(
+            closed_trades=self.portfolio.closed_trades,
+            equity_curve=self.equity_history,
+            initial_equity=self.portfolio.start_of_day_equity
+        )
 
         # Sanitize open positions for JSON compliance
         sanitized_positions = []
@@ -95,13 +106,14 @@ class IndodaxBotController:
                 "equity": round(float(equity), 2),
                 "cash": round(float(cash), 2),
                 "cash_reserve_pct": round(float((cash / equity * 100.0) if equity > 0 else 100.0), 2),
-                "capital_tier": str(tier_info["tier"]),
+                "capital_tier": "UNIFIED_V6.1",
                 "exposure_pct": round(float(exposure_pct), 2),
                 "combined_planned_risk_pct": round(float(combined_risk_pct), 2),
                 "daily_pnl_idr": round(float(daily_pnl_idr), 2),
                 "daily_loss_pct": round(float(daily_loss_info["daily_loss_pct"] * 100.0), 2),
                 "start_of_day_equity": round(float(self.portfolio.start_of_day_equity), 2)
             },
+            "analytics": analytics,
             "open_positions": sanitized_positions,
             "candidates_engine_a": self.latest_candidates_a,
             "candidates_engine_b": self.latest_candidates_b,
@@ -110,7 +122,7 @@ class IndodaxBotController:
         }
 
     async def run_trading_cycle(self):
-        """Main periodic trading logic cycle."""
+        """Main periodic trading logic cycle for V6.1."""
         try:
             # 1. Fetch latest active pairs and tickers
             active_markets = self.market_data.refresh_pairs_and_tickers()
@@ -122,7 +134,6 @@ class IndodaxBotController:
             self.portfolio.update_position_values(current_prices)
             current_equity = self.portfolio.get_current_equity(current_prices)
 
-            # Check SOD reset
             self.portfolio.check_and_reset_sod(current_equity)
 
             # 2. Check Open Position Exits
@@ -145,12 +156,15 @@ class IndodaxBotController:
                     exit_eval = self.engine_b.evaluate_exit(pos, sim_candle, mkt_info)
 
                 if exit_eval and exit_eval["exit"]:
-                    self.portfolio.execute_paper_sell(
+                    sell_res = self.portfolio.execute_paper_sell(
                         position_id=pos["position_id"],
                         exit_price=exit_eval["price"],
                         exit_reason=exit_eval["reason"],
                         market_info=mkt_info
                     )
+                    if sell_res.get("success") and pos["engine"] == "ENGINE_A_SCALPER":
+                        is_win = sell_res["closed_record"]["realized_pnl_idr"] > 0
+                        self.engine_a.record_trade_result(is_win, pair_id, time.time())
 
             if self.emergency_stop_triggered:
                 logger.warning("Emergency Stop Active: Skipping candidate scanning and entries.")
@@ -160,19 +174,18 @@ class IndodaxBotController:
             candidates_a = []
             candidates_b = []
 
-            # Filter top candidate pairs by 24h IDR volume to optimize candle fetching
             sorted_pairs = sorted(active_markets.values(), key=lambda x: x["vol_24h_idr"], reverse=True)[:30]
 
+            now_ts = time.time()
             for mkt in sorted_pairs:
                 pair_id = mkt["pair_id"]
                 has_pos = any(p["pair_id"] == pair_id for p in self.portfolio.open_positions)
 
-                # Construct representative candle history from ticker high/low/last
                 df_synth = self._build_synthetic_candles(mkt)
 
                 exec_info = self.market_data.analyze_executable_liquidity(
                     pair_id=pair_id,
-                    order_size_idr=current_equity * 0.10,
+                    order_size_idr=current_equity * 0.20,
                     is_buy=True
                 )
 
@@ -184,7 +197,8 @@ class IndodaxBotController:
                     df_15m=df_synth,
                     market_info=mkt,
                     execution_info=exec_info,
-                    has_open_position=has_pos
+                    has_open_position=has_pos,
+                    current_timestamp=now_ts
                 )
                 if sig_a.get("valid"):
                     candidates_a.append(sig_a)
@@ -196,59 +210,71 @@ class IndodaxBotController:
                     df_1h=df_synth,
                     market_info=mkt,
                     execution_info=exec_info,
-                    target_position_idr=current_equity * 0.10,
+                    target_position_idr=current_equity * 0.20,
                     has_open_position=has_pos
                 )
                 if sig_b.get("valid"):
                     candidates_b.append(sig_b)
 
-            # Sort candidates
             candidates_a.sort(key=lambda x: x["expected_net_return_pct"], reverse=True)
             candidates_b.sort(key=lambda x: x["score"], reverse=True)
 
             self.latest_candidates_a = candidates_a
             self.latest_candidates_b = candidates_b
 
-            # 4. Active Reserve Deployment & Entry Execution
-            # Rank candidates across both engines
-            all_candidates = candidates_a + candidates_b
-            all_candidates.sort(key=lambda x: x.get("expected_net_return_pct", 0), reverse=True)
+            # 4. Adaptive Engine Routing & Active Reserve Deployment
+            all_pairs = set([c["pair_id"] for c in candidates_a] + [c["pair_id"] for c in candidates_b])
 
-            for cand in all_candidates:
-                mkt_info = active_markets[cand["pair_id"]]
-                exec_info = self.market_data.analyze_executable_liquidity(
-                    pair_id=cand["pair_id"],
-                    order_size_idr=current_equity * 0.10,
-                    is_buy=True
+            for pair_id in all_pairs:
+                sig_a = next((c for c in candidates_a if c["pair_id"] == pair_id), {"valid": False})
+                sig_b = next((c for c in candidates_b if c["pair_id"] == pair_id), {"valid": False})
+
+                has_pos = any(p["pair_id"] == pair_id for p in self.portfolio.open_positions)
+                combined_risk = sum(p.get("planned_risk_idr", 0.0) for p in self.portfolio.open_positions)
+                risk_limit_reached = (combined_risk >= current_equity * 0.03)
+
+                route_res = AdaptiveEngineRouter.route_opportunity(
+                    signal_a=sig_a,
+                    signal_b=sig_b,
+                    has_open_position=has_pos,
+                    is_risk_limit_reached=risk_limit_reached
                 )
 
-                reserve_eval = self.risk_controller.evaluate_active_reserve_deployment(
-                    candidate_signal=cand,
-                    current_equity=current_equity,
-                    available_cash=self.portfolio.cash_idr,
-                    open_positions=self.portfolio.open_positions,
-                    start_of_day_equity=self.portfolio.start_of_day_equity,
-                    market_info=mkt_info,
-                    execution_info=exec_info
-                )
-
-                if reserve_eval.get("approved"):
-                    # Execute Paper Buy Order
-                    self.portfolio.execute_paper_buy(
-                        signal=cand,
-                        position_size_idr=reserve_eval["position_size_idr"],
-                        execution_price=mkt_info["ask"],
-                        planned_risk_idr=reserve_eval["planned_risk_idr"],
-                        market_info=mkt_info
+                chosen_sig = route_res.get("chosen_signal")
+                if chosen_sig:
+                    mkt_info = active_markets[pair_id]
+                    exec_info = self.market_data.analyze_executable_liquidity(
+                        pair_id=pair_id,
+                        order_size_idr=current_equity * 0.20,
+                        is_buy=True
                     )
-                else:
-                    self.portfolio.log_rejected_trade(cand, reserve_eval.get("reason", "Unknown"))
+
+                    reserve_eval = self.risk_controller.evaluate_active_reserve_deployment(
+                        candidate_signal=chosen_sig,
+                        current_equity=current_equity,
+                        available_cash=self.portfolio.cash_idr,
+                        open_positions=self.portfolio.open_positions,
+                        start_of_day_equity=self.portfolio.start_of_day_equity,
+                        market_info=mkt_info,
+                        execution_info=exec_info
+                    )
+
+                    if reserve_eval.get("approved"):
+                        self.portfolio.execute_paper_buy(
+                            signal=chosen_sig,
+                            position_size_idr=reserve_eval["position_size_idr"],
+                            execution_price=mkt_info["ask"],
+                            planned_risk_idr=reserve_eval["planned_risk_idr"],
+                            market_info=mkt_info
+                        )
+                    else:
+                        self.portfolio.log_rejected_trade(chosen_sig, reserve_eval.get("reason", "Unknown"))
 
         except Exception as e:
             logger.error(f"Error in trading cycle: {e}", exc_info=True)
 
     def manual_buy(self, pair_id: str, size_idr: float, engine: str = "MANUAL_ORDER") -> Dict[str, Any]:
-        """Execute interactive manual buy order for pair_id."""
+        """Execute interactive manual buy order."""
         pair_id = pair_id.lower().strip()
         active_markets = self.market_data.refresh_pairs_and_tickers()
 
@@ -269,7 +295,6 @@ class IndodaxBotController:
             "signal_reason": f"Manual Buy Order via Dashboard"
         }
 
-        # Check risk controller rules
         reserve_eval = self.risk_controller.evaluate_active_reserve_deployment(
             candidate_signal=signal,
             current_equity=self.portfolio.get_current_equity({pair_id: ask_price}),
@@ -317,6 +342,10 @@ class IndodaxBotController:
             exit_reason=reason,
             market_info=mkt
         )
+        if res.get("success") and target_pos["engine"] == "ENGINE_A_SCALPER":
+            is_win = res["closed_record"]["realized_pnl_idr"] > 0
+            self.engine_a.record_trade_result(is_win, pair_id, time.time())
+
         return res
 
     def _build_synthetic_candles(self, mkt: Dict[str, Any]) -> pd.DataFrame:
@@ -326,12 +355,9 @@ class IndodaxBotController:
         low = min(price, mkt["low_24h"]) if mkt["low_24h"] > 0 else price * 0.95
         vol = max(1000.0, mkt["vol_24h_idr"] / max(1.0, price))
 
-        # Position of current price in 24h High-Low range (0.0 to 1.0)
         range_span = max(1e-8, high - low)
         range_pos = (price - low) / range_span
 
-        # Starting price 35 bars ago based on 24h trend
-        # If range_pos > 0.5, price moved up from low over 24h
         start_price = low if range_pos > 0.5 else (price * 1.03 if range_pos < 0.3 else price * 0.99)
 
         bars = []
@@ -339,16 +365,12 @@ class IndodaxBotController:
         num_bars = 35
 
         for i in range(num_bars):
-            progress = i / float(num_bars - 1)  # 0.0 to 1.0
+            progress = i / float(num_bars - 1)
 
-            # Smooth trend trajectory towards current price
             bar_close = start_price + (price - start_price) * progress
-
-            # Add slight micro-fluctuations
             noise = (np.sin(i * 0.8) * 0.001) if i < num_bars - 1 else 0.0015
             bar_close = bar_close * (1.0 + noise)
 
-            # Ensure final candle is a strong green candle if trending up
             if i == num_bars - 1:
                 bar_close = price
                 bar_open = price * (0.992 if range_pos >= 0.5 else 0.998)
@@ -357,8 +379,6 @@ class IndodaxBotController:
 
             bar_high = max(bar_open, bar_close) * 1.0015
             bar_low = min(bar_open, bar_close) * 0.9985
-
-            # Volume surge on recent candles
             bar_vol = (vol / num_bars) * (2.2 if i >= num_bars - 5 else 0.9)
 
             bars.append({
@@ -376,8 +396,7 @@ async def main_async(args):
     bot = IndodaxBotController(initial_cash_idr=args.initial_cash)
 
     if args.mode == "backtest":
-        logger.info("Executing Backtest Mode...")
-        # Create synthetic market candle datasets for top assets to demonstrate backtest engine
+        logger.info("Executing Backtest Mode for V6.1-MACO R11...")
         sample_assets = ["btcidr", "ethidr", "solidr", "sgbidr", "dogeidr"]
         dataset = {}
         now = time.time()
@@ -385,7 +404,6 @@ async def main_async(args):
             base_price = 100000.0 if asset == "btcidr" else 10000.0
             bars = []
             for i in range(200):
-                # Simulated price movement
                 change = (np.sin(i / 10.0) * 0.02) + (0.001 * (i % 5))
                 c_price = base_price * (1.0 + change)
                 bars.append({
@@ -402,7 +420,7 @@ async def main_async(args):
         res = backtester.run_backtest(dataset)
 
         print("\n" + "="*60)
-        print(" INDODAX DUAL ENGINE — BACKTEST RESULTS")
+        print(" INDODAX UNIFIED DUAL ENGINE V6.1 — BACKTEST RESULTS")
         print("="*60)
         for k, v in res.items():
             print(f" {k.replace('_', ' ').title():<30} : {v}")
@@ -414,13 +432,11 @@ async def main_async(args):
     config = uvicorn.Config(app=dashboard_app, host="0.0.0.0", port=args.port, log_level="warning")
     server = uvicorn.Server(config)
 
-    logger.info(f"Starting Indodax Dual Engine Bot in PAPER_TRADING mode...")
+    logger.info(f"Starting Indodax Dual Engine Bot V6.1 in PAPER_TRADING mode...")
     logger.info(f"Web Dashboard available at http://localhost:{args.port}")
 
-    # Run dashboard server in background task
     asyncio.create_task(server.serve())
 
-    # Main Trading Loop
     bot.running = True
     while bot.running:
         await bot.run_trading_cycle()
@@ -429,9 +445,9 @@ async def main_async(args):
         await asyncio.sleep(args.scan_interval)
 
 def main():
-    parser = argparse.ArgumentParser(description="INDODAX DUAL ENGINE — V5.3-MACO R3")
+    parser = argparse.ArgumentParser(description="INDODAX UNIFIED DUAL ENGINE — V6.1-MACO R11")
     parser.add_argument("--mode", choices=["paper", "backtest"], default="paper", help="Execution mode")
-    parser.add_argument("--initial-cash", type=float, default=10_000_000.0, help="Initial cash IDR for paper trading")
+    parser.add_argument("--initial-cash", type=float, default=DEFAULT_PAPER_INITIAL_IDR, help="Initial cash IDR for paper trading")
     parser.add_argument("--port", type=int, default=8000, help="Web dashboard port")
     parser.add_argument("--scan-interval", type=int, default=5, help="Scan interval in seconds")
 

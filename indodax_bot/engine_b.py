@@ -1,12 +1,12 @@
 """
-Engine B — Extreme Momentum Hunter Strategy
-Rides multi-hour/daily momentum trends with 0-100 scoring system and trailing exits.
+Engine B — Extreme Momentum Hunter Strategy for V6.1-MACO R11
+Rides multi-hour/daily momentum trends with 0-100 scoring system, Market Regime Filter, and trailing exits.
 """
 
 import logging
 import pandas as pd
 from typing import Dict, Any, Optional
-from indodax_bot.indicators import TechnicalIndicators
+from indodax_bot.indicators import TechnicalIndicators, MarketRegimeDetector
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ class ExtremeMomentumHunterEngineB:
         has_open_position: bool
     ) -> Dict[str, Any]:
         """
-        Evaluates Extreme Momentum Hunter entry with 0-100 score.
+        Section 5: Evaluates Extreme Momentum Hunter entry with 0-100 score & Regime Check.
         """
         if has_open_position:
             return {"valid": False, "score": 0.0, "reason": f"Open position already exists in {pair_id}"}
@@ -36,9 +36,21 @@ class ExtremeMomentumHunterEngineB:
             return {"valid": False, "score": 0.0, "reason": "Insufficient candle history for Engine B"}
 
         spread_pct = market_info.get("spread_pct", 0.005)
+
+        # 1. Market Regime & Exhaustion Check
+        regime_res = MarketRegimeDetector.classify_regime(df, spread_pct)
+        regime = regime_res.get("regime")
+
+        if regime in [MarketRegimeDetector.OVEREXTENDED_PUMP_EXHAUSTION, MarketRegimeDetector.BEARISH_HIGH_RISK]:
+            return {
+                "valid": False,
+                "score": 0.0,
+                "reason": f"Regime Rejected: Market classified as {regime} ({regime_res.get('reason')})"
+            }
+
         available_depth_idr = execution_info.get("total_available_idr", target_position_idr * 2.0)
 
-        # Calculate 0 - 100 momentum score
+        # 2. Calculate 0 - 100 momentum score
         score_res = TechnicalIndicators.calculate_engine_b_momentum_score(
             df=df,
             spread_pct=spread_pct,
@@ -61,12 +73,10 @@ class ExtremeMomentumHunterEngineB:
         atr = TechnicalIndicators.compute_atr(df, 14).iloc[-1]
         atr_pct = atr / price if price > 0 else 0.02
 
-        # Costs
         slippage_pct = execution_info.get("slippage_pct", 0.0015)
         taker_fee = market_info.get("trade_fee_percent_taker", 0.002)
         total_cost_pct = spread_pct + taker_fee * 2 + slippage_pct
 
-        # Initial stop distance based on ATR and structure
         stop_loss_distance_pct = max(0.015, atr_pct * 2.0 + total_cost_pct)
         expected_net_return_pct = (atr_pct * 3.5) - total_cost_pct
 
@@ -84,7 +94,7 @@ class ExtremeMomentumHunterEngineB:
             "expected_net_return_pct": expected_net_return_pct,
             "stop_loss_pct": stop_loss_distance_pct,
             "take_profit_pct": None,  # No fixed TP per master spec (let winners run)
-            "signal_reason": f"Extreme Momentum Score: {total_score:.1f}/100"
+            "signal_reason": f"Extreme Momentum Score: {total_score:.1f}/100 in {regime}"
         }
 
     def evaluate_exit(
@@ -95,10 +105,9 @@ class ExtremeMomentumHunterEngineB:
     ) -> Dict[str, Any]:
         """
         Evaluates Engine B exit conditions:
-        - Trailing stop update (follows trend higher)
-        - Structure breakdown (break below recent swing low or EMA21)
-        - Unsafe liquidity deterioration
-        - NO fixed maximum take profit threshold
+        - Trailing stop update
+        - Trend structure deterioration
+        - Liquidity safety check
         """
         entry_price = position["entry_price"]
         current_price = float(latest_candle['close'])
@@ -109,10 +118,9 @@ class ExtremeMomentumHunterEngineB:
         stop_loss_price = position["stop_loss_price"]
         atr = position.get("atr", entry_price * 0.02)
 
-        # Dynamic Trailing Stop for Momentum Hunter
-        # As price advances, trail by 2.0x ATR below highest price
+        # Dynamic Trailing Stop
         gain_pct = (highest_price - entry_price) / entry_price
-        if gain_pct >= 0.02:  # Profit >= 2%
+        if gain_pct >= 0.02:
             new_trailing_stop = highest_price - (atr * 2.0)
             if new_trailing_stop > stop_loss_price:
                 position["stop_loss_price"] = new_trailing_stop
@@ -122,7 +130,7 @@ class ExtremeMomentumHunterEngineB:
         if current_price <= stop_loss_price or float(latest_candle['low']) <= stop_loss_price:
             return {"exit": True, "reason": "TRAILING_STOP_HIT", "price": stop_loss_price}
 
-        # 2. Structure Breakdown Exit: Close below 21-EMA with gain lock-in
+        # 2. Structure Breakdown
         ema21 = latest_candle.get("ema21")
         if ema21 and current_price < ema21 and gain_pct > 0.03:
             return {"exit": True, "reason": "TREND_STRUCTURE_DETERIORATION", "price": current_price}

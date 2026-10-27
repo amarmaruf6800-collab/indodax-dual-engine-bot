@@ -1,11 +1,154 @@
 """
-Technical Indicators Engine & Momentum Scoring System.
-Calculates EMA, ATR, RVOL, ROC, Breakouts, Compression, and Engine B 0-100 Momentum Score.
+Technical Indicators Engine, Market Regime Detector & False Breakout Filter for V6.1-MACO R11.
 """
 
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, Tuple, Optional
+
+class MarketRegimeDetector:
+    """
+    Section 3: Classifies asset condition into 7 distinct market regimes.
+    """
+    SIDEWAYS_LOW_VOLATILITY = "SIDEWAYS_LOW_VOLATILITY"
+    NORMAL_TREND = "NORMAL_TREND"
+    BULLISH_MOMENTUM = "BULLISH_MOMENTUM"
+    EXTREME_MOMENTUM_BREAKOUT = "EXTREME_MOMENTUM_BREAKOUT"
+    OVEREXTENDED_PUMP_EXHAUSTION = "OVEREXTENDED_PUMP_EXHAUSTION"
+    BEARISH_HIGH_RISK = "BEARISH_HIGH_RISK"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+
+    @classmethod
+    def classify_regime(cls, df: pd.DataFrame, spread_pct: float = 0.003) -> Dict[str, Any]:
+        if len(df) < 25:
+            return {"regime": cls.INSUFFICIENT_DATA, "reason": "Insufficient candle history (<25)"}
+
+        df = df.copy()
+        df['ema9'] = TechnicalIndicators.compute_ema(df['close'], 9)
+        df['ema21'] = TechnicalIndicators.compute_ema(df['close'], 21)
+        df['ema50'] = TechnicalIndicators.compute_ema(df['close'], 50)
+        df['atr'] = TechnicalIndicators.compute_atr(df, 14)
+        df['rvol'] = TechnicalIndicators.compute_rvol(df, 20)
+        df['roc'] = TechnicalIndicators.compute_roc(df['close'], 10)
+
+        latest = df.iloc[-1]
+        price = float(latest['close'])
+        rvol = float(latest['rvol'])
+        roc = float(latest['roc'])
+        ema9 = float(latest['ema9'])
+        ema21 = float(latest['ema21'])
+        ema50 = float(latest['ema50'])
+        atr = float(latest['atr'])
+
+        atr_sma = df['atr'].rolling(window=20, min_periods=1).mean().iloc[-1]
+        atr_ratio = (atr / atr_sma) if atr_sma > 0 else 1.0
+
+        # Check Overextended / Pump Exhaustion
+        dist_from_ema50 = (price - ema50) / ema50 if ema50 > 0 else 0.0
+        candle_range = max(1e-8, float(latest['high'] - latest['low']))
+        upper_wick = float(latest['high'] - max(latest['open'], latest['close']))
+        wick_ratio = upper_wick / candle_range
+
+        if dist_from_ema50 > 0.08 and wick_ratio > 0.40 and roc > 5.0:
+            return {
+                "regime": cls.OVEREXTENDED_PUMP_EXHAUSTION,
+                "reason": f"Price {dist_from_ema50*100:.1f}% above EMA50 with upper wick rejection ({wick_ratio*100:.0f}%)",
+                "metrics": {"dist_from_ema50": dist_from_ema50, "wick_ratio": wick_ratio}
+            }
+
+        # Check Bearish High Risk
+        if ema9 < ema21 < ema50 or roc < -3.0:
+            return {
+                "regime": cls.BEARISH_HIGH_RISK,
+                "reason": f"Bearish EMA alignment (EMA9<21<50) or sharp drop (ROC={roc:.1f}%)",
+                "metrics": {"roc_pct": roc}
+            }
+
+        # Check Extreme Momentum Breakout
+        breakout_info = TechnicalIndicators.detect_breakout_retest(df, lookback=20)
+        if breakout_info["is_breakout"] and rvol >= 1.8 and atr_ratio >= 1.3:
+            return {
+                "regime": cls.EXTREME_MOMENTUM_BREAKOUT,
+                "reason": f"Confirmed Breakout with RVOL={rvol:.1f} & ATR expansion ratio {atr_ratio:.2f}",
+                "metrics": {"rvol": rvol, "atr_ratio": atr_ratio, "breakout_info": breakout_info}
+            }
+
+        # Check Bullish Momentum
+        if ema9 > ema21 and rvol >= 1.2 and roc >= 0.3:
+            return {
+                "regime": cls.BULLISH_MOMENTUM,
+                "reason": f"Bullish EMA alignment (EMA9>21) with RVOL={rvol:.1f} & ROC={roc:.1f}%",
+                "metrics": {"rvol": rvol, "roc_pct": roc}
+            }
+
+        # Check Sideways / Low Volatility
+        if atr_ratio < 0.85 or (abs(roc) < 0.3 and rvol < 1.0):
+            return {
+                "regime": cls.SIDEWAYS_LOW_VOLATILITY,
+                "reason": f"Low volatility (ATR ratio={atr_ratio:.2f}, ROC={roc:.1f}%)",
+                "metrics": {"atr_ratio": atr_ratio, "rvol": rvol}
+            }
+
+        return {
+            "regime": cls.NORMAL_TREND,
+            "reason": "Orderly market trend without extreme momentum",
+            "metrics": {"rvol": rvol, "roc_pct": roc}
+        }
+
+
+class FalseBreakoutFilter:
+    """
+    Section 4.F: False Breakout Filter to protect capital against fakeouts.
+    """
+    @staticmethod
+    def evaluate_breakout(df: pd.DataFrame, spread_pct: float, slippage_pct: float) -> Dict[str, Any]:
+        if len(df) < 25:
+            return {"is_valid": False, "reason": "Insufficient candles for breakout evaluation"}
+
+        latest = df.iloc[-1]
+        candle_range = max(1e-8, float(latest['high'] - latest['low']))
+        upper_wick = float(latest['high'] - max(latest['open'], latest['close']))
+        wick_ratio = upper_wick / candle_range
+
+        # 1. Wick Rejection Filter
+        if wick_ratio > 0.40:
+            return {
+                "is_valid": False,
+                "reason": f"Upper wick rejection ({wick_ratio*100:.1f}% > 40%) indicates sell pressure at resistance"
+            }
+
+        # 2. Breakout Level Verification
+        breakout_info = TechnicalIndicators.detect_breakout_retest(df, lookback=20)
+        resistance = breakout_info.get("resistance", 0.0)
+        price = float(latest['close'])
+
+        if resistance > 0 and price > resistance * 1.05:
+            return {
+                "is_valid": False,
+                "reason": f"Price is overextended ({((price - resistance)/resistance)*100:.1f}% > 5%) above broken resistance"
+            }
+
+        # 3. Volume Surge Filter
+        rvol = TechnicalIndicators.compute_rvol(df).iloc[-1]
+        if rvol < 1.1:
+            return {
+                "is_valid": False,
+                "reason": f"Insufficient relative volume surge (RVOL {rvol:.2f} < 1.1) on breakout"
+            }
+
+        # 4. Spread & Execution Filter
+        if spread_pct > 0.005:
+            return {
+                "is_valid": False,
+                "reason": f"Excessive spread ({spread_pct*100:.2f}% > 0.5%) threatens breakout net expectancy"
+            }
+
+        return {
+            "is_valid": True,
+            "reason": f"Valid breakout: RVOL={rvol:.1f}, low wick rejection ({wick_ratio*100:.0f}%), tight spread",
+            "resistance": resistance
+        }
+
 
 class TechnicalIndicators:
     @staticmethod
@@ -32,7 +175,6 @@ class TechnicalIndicators:
     def compute_rvol(df: pd.DataFrame, period: int = 20) -> pd.Series:
         """Relative Volume (RVOL) = current volume / rolling SMA of volume."""
         vol_sma = df['volume'].rolling(window=period, min_periods=1).mean()
-        # Avoid div by zero
         vol_sma = vol_sma.replace(0, 1.0)
         return df['volume'] / vol_sma
 
@@ -45,9 +187,7 @@ class TechnicalIndicators:
 
     @staticmethod
     def detect_breakout_retest(df: pd.DataFrame, lookback: int = 20) -> Dict[str, Any]:
-        """
-        Detects if price recently broke above resistance and is retesting or maintaining breakout.
-        """
+        """Detects if price recently broke above resistance and is retesting or maintaining breakout."""
         if len(df) < lookback + 2:
             return {"is_breakout": False, "is_retest": False, "resistance": 0.0}
 
@@ -71,16 +211,13 @@ class TechnicalIndicators:
 
     @staticmethod
     def detect_trend_structure(df: pd.DataFrame, window: int = 5) -> Dict[str, Any]:
-        """
-        Checks for Higher Highs and Higher Lows (HH & HL).
-        """
+        """Checks for Higher Highs and Higher Lows (HH & HL)."""
         if len(df) < window * 3:
             return {"is_uptrend": False, "structure_score": 0.0}
 
         highs = df['high'].values
         lows = df['low'].values
 
-        # Local peaks and troughs
         p1_high = np.max(highs[-window*3:-window*2])
         p2_high = np.max(highs[-window*2:-window])
         p3_high = np.max(highs[-window:])
@@ -110,15 +247,6 @@ class TechnicalIndicators:
         orderbook_depth_idr: float,
         target_position_idr: float
     ) -> Dict[str, Any]:
-        """
-        Calculates Engine B Momentum Score (0 - 100 points):
-        - Relative Volume: 20 pts
-        - Breakout Quality: 20 pts
-        - Volatility Expansion: 15 pts
-        - Trend Structure: 15 pts
-        - Order-book Quality: 15 pts
-        - Price Acceleration: 15 pts
-        """
         if len(df) < 30:
             return {"total_score": 0.0, "details": "Insufficient candle data"}
 
@@ -154,7 +282,6 @@ class TechnicalIndicators:
             pts_breakout = 10.0
 
         # 3. Volatility Expansion (15 points)
-        # Ratio of current ATR to 20-period ATR SMA
         atr_sma = df['atr'].rolling(window=20, min_periods=1).mean().iloc[-1]
         atr_ratio = float(latest['atr']) / atr_sma if atr_sma > 0 else 1.0
         if atr_ratio >= 1.8:
@@ -171,11 +298,10 @@ class TechnicalIndicators:
             pts_trend = min(15.0, pts_trend + 3.0)
 
         # 5. Order-book Quality (15 points)
-        # Tight spread (<0.5%) and sufficient depth (>2x target size)
         pts_ob = 0.0
-        if spread_pct <= 0.003:  # <= 0.3%
+        if spread_pct <= 0.003:
             pts_ob += 7.5
-        elif spread_pct <= 0.008: # <= 0.8%
+        elif spread_pct <= 0.008:
             pts_ob += 5.0
         else:
             pts_ob += max(0.0, 7.5 * (1.0 - spread_pct / 0.02))
@@ -190,7 +316,7 @@ class TechnicalIndicators:
 
         # 6. Price Acceleration (15 points)
         roc = float(latest['roc'])
-        if roc >= 5.0:  # +5% ROC
+        if roc >= 5.0:
             pts_accel = 15.0
         elif roc >= 2.0:
             pts_accel = 10.0 + (roc - 2.0) * 1.66
